@@ -1,0 +1,82 @@
+package fat
+
+// This file contains a function for limiting the range and remapping offsets
+// when working with an underlying ReadSeeker. We use it to re-map offsets to 0
+// when looking at a FAT partition in a larger disk image containing several
+// partitions.
+
+import (
+	"fmt"
+	"io"
+)
+
+// Wraps an underlying ReadSeeker, but limits reads to be within a single
+// region. WARNING: This will modify the offset of the underlying ReadSeeker
+// when used.
+type limitedReadSeeker struct {
+	wrapped    io.ReadSeeker
+	baseOffset int64
+	limit      int64
+	// The number of bytes past the baseOffset the current seek is to.
+	currentOffset int64
+}
+
+// Returns a new io.ReadSeeker using the input ReadSeeker, but with offset 0
+// corresponding to the given baseOffset, and EOF at the given limit. WARNING:
+// using the returned io.ReadSeeker will modify the offset in the original.
+func LimitReadSeeker(input io.ReadSeeker, baseOffset,
+	limit int64) (io.ReadSeeker, error) {
+	if limit <= baseOffset {
+		return nil, fmt.Errorf("The base offset must be below the limit")
+	}
+	_, e := input.Seek(baseOffset, io.SeekStart)
+	if e != nil {
+		return nil, fmt.Errorf("Failed seeking to base offset in underlying "+
+			"io.ReadSeeker: %w", e)
+	}
+	return &limitedReadSeeker{
+		wrapped:       input,
+		currentOffset: 0,
+		baseOffset:    baseOffset,
+		limit:         limit,
+	}, nil
+}
+
+func (s *limitedReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	newOffset := s.currentOffset
+	limitedSize := s.limit - s.baseOffset
+	switch whence {
+	case io.SeekStart:
+		newOffset = offset
+	case io.SeekCurrent:
+		newOffset -= offset
+	case io.SeekEnd:
+		newOffset = limitedSize + offset
+	}
+	if newOffset >= limitedSize {
+		s.currentOffset = limitedSize
+		return limitedSize, io.EOF
+	}
+	s.currentOffset = newOffset
+	_, e := s.wrapped.Seek(newOffset, io.SeekStart)
+	return newOffset, e
+}
+
+func (s *limitedReadSeeker) Read(dst []byte) (int, error) {
+	limitedSize := s.limit - s.baseOffset
+	readSize := len(dst)
+	var resultErr error
+	if readSize > int(limitedSize-s.currentOffset) {
+		resultErr = io.EOF
+		readSize = int(limitedSize - s.currentOffset)
+	}
+	bytesRead, e := s.wrapped.Read(dst[0:readSize])
+	s.currentOffset += int64(bytesRead)
+	// If we didn't get an error from the read, return our own EOF error if it
+	// was detected.
+	if e == nil {
+		return bytesRead, resultErr
+	}
+	// Return the underlying error returned by the wrapped read.
+	return bytesRead, e
+}

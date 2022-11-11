@@ -16,7 +16,7 @@ import (
 type limitedReadSeeker struct {
 	wrapped    io.ReadSeeker
 	baseOffset int64
-	limit      int64
+	size       int64
 	// The number of bytes past the baseOffset the current seek is to.
 	currentOffset int64
 }
@@ -38,37 +38,37 @@ func LimitReadSeeker(input io.ReadSeeker, baseOffset,
 		wrapped:       input,
 		currentOffset: 0,
 		baseOffset:    baseOffset,
-		limit:         limit,
+		size:          limit - baseOffset,
 	}, nil
 }
 
 func (s *limitedReadSeeker) Seek(offset int64, whence int) (int64, error) {
 	newOffset := s.currentOffset
-	limitedSize := s.limit - s.baseOffset
 	switch whence {
 	case io.SeekStart:
 		newOffset = offset
 	case io.SeekCurrent:
 		newOffset -= offset
 	case io.SeekEnd:
-		newOffset = limitedSize + offset
+		newOffset = s.size + offset
 	}
-	if newOffset >= limitedSize {
-		s.currentOffset = limitedSize
-		return limitedSize, io.EOF
+	if newOffset >= s.size {
+		s.currentOffset = s.size
+		return s.size, io.EOF
 	}
 	s.currentOffset = newOffset
-	_, e := s.wrapped.Seek(newOffset, io.SeekStart)
+	_, e := s.wrapped.Seek(s.baseOffset+newOffset, io.SeekStart)
 	return newOffset, e
 }
 
 func (s *limitedReadSeeker) Read(dst []byte) (int, error) {
-	limitedSize := s.limit - s.baseOffset
 	readSize := len(dst)
 	var resultErr error
-	if readSize > int(limitedSize-s.currentOffset) {
+	readEndOffset := s.currentOffset + int64(readSize)
+	if readEndOffset > s.size {
 		resultErr = io.EOF
-		readSize = int(limitedSize - s.currentOffset)
+		bytesOver := readEndOffset - s.size
+		readSize = readSize - int(bytesOver)
 	}
 	bytesRead, e := s.wrapped.Read(dst[0:readSize])
 	s.currentOffset += int64(bytesRead)

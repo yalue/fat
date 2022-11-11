@@ -12,7 +12,10 @@ import (
 
 func run() int {
 	var imagePath string
+	var partitionIndex int
 	flag.StringVar(&imagePath, "image", "", "The path to the disk image.")
+	flag.IntVar(&partitionIndex, "partition_index", 0,
+		"The index of the partition containing the FAT32 filesystem.")
 	flag.Parse()
 	if imagePath == "" {
 		fmt.Println("Invalid arguments. Run with -help for more information.")
@@ -32,8 +35,20 @@ func run() int {
 	fmt.Printf("Loaded MBR in %s OK.\n", imagePath)
 	for i := range mbr.Partitions[:] {
 		partitionEntry := &(mbr.Partitions[i])
-		fmt.Printf("  Partition %d: %s\n", i+1, partitionEntry)
+		fmt.Printf("  Partition %d: %s\n", i, partitionEntry)
 	}
+	fmt.Printf("Attempting to load from partition %d.\n", partitionIndex)
+	partition, e := fat.GetPartition(imageFile, mbr, partitionIndex)
+	if e != nil {
+		fmt.Printf("Failed getting partition %d: %s\n", partitionIndex, e)
+		return 1
+	}
+	header, e := fat.ParseFAT32Header(partition)
+	if e != nil {
+		fmt.Printf("Error reading FAT32 header: %s\n", e)
+		return 1
+	}
+	fmt.Printf("Read FAT32 headers OK:\n%s\n", header.FormatHumanReadable())
 	return 0
 }
 

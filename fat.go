@@ -1,6 +1,8 @@
 // This package provides tools for reading or recovering data from FAT32
 // filesystem images.  It is unlikely to be a useful general-purpose library;
-// it was written for some specific data-recovery projects.
+// it was written for some specific data-recovery projects. Note that virtually
+// none of the structs in this are designed to be thread-safe; they rely on
+// seeking within a file image, and the resulting offsets not being perturbed.
 package fat
 
 import (
@@ -158,7 +160,7 @@ func (ebr *FAT32EBR) FormatHumanReadable() string {
 	toReturn += fmt.Sprintf("  Volume ID 0x%08x\n", ebr.VolumeID)
 	toReturn += fmt.Sprintf("  Volume label: \"%s\"\n", ebr.VolumeLabel)
 	toReturn += fmt.Sprintf("  System ID: \"%s\"\n", ebr.SystemID)
-	toReturn += fmt.Sprintf("  Boot signature: 0x%04x\n", ebr.BootSignature)
+	toReturn += fmt.Sprintf("  Boot signature: 0x%04x", ebr.BootSignature)
 	return toReturn
 }
 
@@ -178,7 +180,6 @@ func (h *FAT32Header) FormatHumanReadable() string {
 
 // Parses a FAT32 header, expected at the beginning of the given disk image.
 func ParseFAT32Header(image io.ReadSeeker) (*FAT32Header, error) {
-	// TODO: Error check signatures and stuff here.
 	var toReturn FAT32Header
 	_, e := image.Seek(0, io.SeekStart)
 	if e != nil {
@@ -188,5 +189,115 @@ func ParseFAT32Header(image io.ReadSeeker) (*FAT32Header, error) {
 	if e != nil {
 		return nil, fmt.Errorf("Error parsing FAT32 header: %w", e)
 	}
+	if toReturn.BPB.BytesPerSector != SectorSize {
+		return nil, fmt.Errorf("Unsupported bytes per sector: %d, need %d",
+			toReturn.BPB.BytesPerSector, SectorSize)
+	}
+	// NOTE: It may be good to do more signature checking here?
 	return &toReturn, nil
+}
+
+// The FSInfo structure used by FAT32 to do things like speed up free space
+// computations and find empty sectors.
+type FSInfo struct {
+	Signature1                uint32
+	Reserved1                 [480]byte
+	Signature2                uint32
+	LastKnownFreeCluster      uint32
+	FirstAvailableClusterHint uint32
+	Reserved2                 [12]byte
+	Signature3                uint32
+}
+
+// Checks that the signatures in the FSInfo struct match, and returns a non-nil
+// error if one of them is wrong.
+func (n *FSInfo) Validate() error {
+	expected := uint32(0x41615252)
+	if n.Signature1 != expected {
+		return fmt.Errorf("Bad first signature. Expected 0x%08x, got 0x%08x",
+			expected, n.Signature1)
+	}
+	expected = 0x61417272
+	if n.Signature2 != expected {
+		return fmt.Errorf("Bad second signature. Expected 0x%08x, got 0x%08x",
+			expected, n.Signature2)
+	}
+	expected = 0xaa550000
+	if n.Signature3 != expected {
+		return fmt.Errorf("Bad third signature. Expected 0x%08x, got 0x%08x",
+			expected, n.Signature3)
+	}
+	return nil
+}
+
+// Returns a multi-line string containing information from the FSInfo
+// structure.
+func (n *FSInfo) FormatHumanReadable() string {
+	toReturn := "FAT32 FSInfo structure:\n"
+	toReturn += fmt.Sprintf("  Last known free cluster: 0x%08x (%d)\n",
+		n.LastKnownFreeCluster, n.LastKnownFreeCluster)
+	toReturn += fmt.Sprintf("  First available cluster hint: 0x%08x (%d)",
+		n.FirstAvailableClusterHint, n.FirstAvailableClusterHint)
+	return toReturn
+}
+
+// Wraps all of the stuff we need to track regarding the FAT32 FS.
+type FAT32Filesystem struct {
+	// The actual content of the full image, starting with the BPB. Must
+	// outlive the FAT32Filesystem object.
+	Content io.ReadSeeker
+	// The parsed BPB and EBR
+	Header *FAT32Header
+	// The parsed FSInfo block
+	Info *FSInfo
+}
+
+// Prints a human-readable string of all metadata associated with this FAT32
+// filesystem.
+func (s *FAT32Filesystem) FormatHumanReadable() string {
+	toReturn := s.Header.FormatHumanReadable() + "\n" +
+		s.Info.FormatHumanReadable()
+	return toReturn
+}
+
+// To be called after setting s.Content and s.Header. Finds and parses the
+// FSInfo block, populating s.Info.
+func (s *FAT32Filesystem) parseFSInfo() error {
+	byteOffset := int64(s.Header.EBR.FSInfoSector) * SectorSize
+	_, e := s.Content.Seek(byteOffset, io.SeekStart)
+	if e != nil {
+		return fmt.Errorf("Failed seeking to FSInfo offset: %w", e)
+	}
+	var info FSInfo
+	e = binary.Read(s.Content, binary.LittleEndian, &info)
+	if e != nil {
+		return fmt.Errorf("Failed reading FSInfo struct: %w", e)
+	}
+	e = (&info).Validate()
+	if e != nil {
+		return fmt.Errorf("Invalid FSInfo struct: %w", e)
+	}
+	s.Info = &info
+	return nil
+}
+
+// Loads our FAT32Filesystem struct, parsing header contents as necessary.
+// The content ReadSeeker must outlive the usage of the returned
+// FAT32Filesystem object.  For example, if it's backed by a file, the file
+// should not be closed until the FAT32Filesystem isn't needed anymore.
+func NewFAT32Filesystem(content io.ReadSeeker) (*FAT32Filesystem, error) {
+	header, e := ParseFAT32Header(content)
+	if e != nil {
+		return nil, fmt.Errorf("Error reading FAT32 header: %w", e)
+	}
+	toReturn := &FAT32Filesystem{
+		Content: content,
+		Header:  header,
+		Info:    nil,
+	}
+	e = toReturn.parseFSInfo()
+	if e != nil {
+		return nil, fmt.Errorf("Error reading FSInfo block: %w", e)
+	}
+	return toReturn, nil
 }

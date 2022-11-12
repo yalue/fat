@@ -43,12 +43,12 @@ func run() int {
 		fmt.Printf("Failed getting partition %d: %s\n", partitionIndex, e)
 		return 1
 	}
-	header, e := fat.ParseFAT32Header(partition)
+	fatFS, e := fat.NewFAT32Filesystem(partition)
 	if e != nil {
-		fmt.Printf("Error reading FAT32 header: %s\n", e)
+		fmt.Printf("Error loading FAT32 filesystem: %s\n", e)
 		return 1
 	}
-	fmt.Printf("Read FAT32 headers OK:\n%s\n", header.FormatHumanReadable())
+	fmt.Printf("Loaded FAT32 FS OK:\n%s\n", fatFS.FormatHumanReadable())
 	return 0
 }
 

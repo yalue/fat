@@ -21,6 +21,30 @@ type limitedReadSeeker struct {
 	currentOffset int64
 }
 
+// Used to optimize wrapping limitedReadSeeker instances: if it's detected,
+// just use the original wrapped object and adjust the offsets.
+func nestedReadSeekerOptimization(input *limitedReadSeeker, baseOffset,
+	limit int64) (io.ReadSeeker, error) {
+	if (baseOffset + limit) > input.size {
+		return nil, fmt.Errorf("Size of nested LimitedReadSeeker exceeds " +
+			"the limit of the original instance")
+	}
+	// We already checked that the limit is larger than the offset.
+	size := limit - baseOffset
+	newBaseOffset := input.baseOffset + baseOffset
+	_, e := input.wrapped.Seek(newBaseOffset, io.SeekStart)
+	if e != nil {
+		return nil, fmt.Errorf("Failed seeking to base offset in underlying "+
+			"(wrapped) io.ReadSeeker: %w", e)
+	}
+	return &limitedReadSeeker{
+		wrapped:       input.wrapped,
+		baseOffset:    newBaseOffset,
+		size:          size,
+		currentOffset: 0,
+	}, nil
+}
+
 // Returns a new io.ReadSeeker using the input ReadSeeker, but with offset 0
 // corresponding to the given baseOffset, and EOF at the given limit. WARNING:
 // using the returned io.ReadSeeker will modify the offset in the original.
@@ -28,6 +52,10 @@ func LimitReadSeeker(input io.ReadSeeker, baseOffset,
 	limit int64) (io.ReadSeeker, error) {
 	if limit <= baseOffset {
 		return nil, fmt.Errorf("The base offset must be below the limit")
+	}
+	tmp, isNested := input.(*limitedReadSeeker)
+	if isNested {
+		return nestedReadSeekerOptimization(tmp, baseOffset, limit)
 	}
 	_, e := input.Seek(baseOffset, io.SeekStart)
 	if e != nil {

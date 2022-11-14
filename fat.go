@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"regexp"
 )
 
 // The standard size of a drive sector, in bytes.
@@ -116,7 +117,9 @@ func (bpb *BIOSParameterBlock) FormatHumanReadable() string {
 	toReturn += fmt.Sprintf("  Sectors per track: %d\n", bpb.SectorsPerTrack)
 	toReturn += fmt.Sprintf("  Head count: %d\n", bpb.MediaHeadCount)
 	toReturn += fmt.Sprintf("  Hidden sectors: %d\n", bpb.HiddenSectorCount)
-	toReturn += fmt.Sprintf("  Large sector count: %d", bpb.LargeSectorCount)
+	clusterCount := bpb.LargeSectorCount / uint32(bpb.SectorsPerCluster)
+	toReturn += fmt.Sprintf("  Large sector count: %d (needs %d clusters)",
+		bpb.LargeSectorCount, clusterCount)
 	return toReturn
 }
 
@@ -146,8 +149,10 @@ type FAT32EBR struct {
 // Returns a multi-line string formatting the EBR information in a
 // human-readable fashion.
 func (ebr *FAT32EBR) FormatHumanReadable() string {
+	mbPerFAT := (float32(ebr.SectorsPerFAT) * SectorSize) / (1024.0 * 1024.0)
 	toReturn := "FAT32 EBR information:\n"
-	toReturn += fmt.Sprintf("  Sectors per FAT: %d\n", ebr.SectorsPerFAT)
+	toReturn += fmt.Sprintf("  Sectors per FAT: %d (%.02f MB per FAT)\n",
+		ebr.SectorsPerFAT, mbPerFAT)
 	toReturn += fmt.Sprintf("  Flags: 0x%04x\n", ebr.Flags)
 	toReturn += fmt.Sprintf("  FAT version: %d\n", ebr.FATVersion)
 	toReturn += fmt.Sprintf("  Root dir cluster #: %d\n",
@@ -250,6 +255,8 @@ type FAT32Filesystem struct {
 	Header *FAT32Header
 	// The parsed FSInfo block
 	Info *FSInfo
+	// We'll buffer the entire FAT in memory, unless it becomes a problem.
+	FAT []uint32
 }
 
 // Prints a human-readable string of all metadata associated with this FAT32
@@ -281,6 +288,211 @@ func (s *FAT32Filesystem) parseFSInfo() error {
 	return nil
 }
 
+// Reads the actual FAT into s.FAT. Expected to be called after the header has
+// been read.
+func (s *FAT32Filesystem) loadFAT() error {
+	fatSize := uint32(s.Header.EBR.SectorsPerFAT) * SectorSize
+	// Just toss this in as a sanity check; we'll try to handle huge FATs, but
+	// print a warning as it's likely an error in the original use case.
+	if fatSize >= (1024 * 1024 * 1024) {
+		fmt.Printf("WARNING: Large FAT size: %d bytes.\n", fatSize)
+	}
+	fatEntryCount := fatSize / 4
+	fat := make([]uint32, fatEntryCount)
+	fatOffset := int64(s.Header.BPB.ReservedSectorCount) * SectorSize
+	_, e := s.Content.Seek(fatOffset, io.SeekStart)
+	if e != nil {
+		return fmt.Errorf("Error seeking start of FAT: %w", e)
+	}
+	e = binary.Read(s.Content, binary.LittleEndian, fat)
+	if e != nil {
+		return fmt.Errorf("Error reading FAT: %w", e)
+	}
+	s.FAT = fat
+	return nil
+}
+
+// Used to keep track of a single "chain" of clusters, corresponding
+// (hopefully) to one file.
+type FATChain struct {
+	// The cluster on which the file starts.
+	StartCluster uint32
+	// True if the file is on entirely subsequent clusters, otherwise false.
+	Contiguous bool
+	// The chain's size, in bytes. Note that this may differ from the file
+	// size, since it will always be rounded up to a whole cluster.
+	Size uint64
+}
+
+// Populates the given FATChain structure, starting with the given endCluster
+// index. Requires a pre-computed reverse FAT, mapping each cluster to the
+// index of the FAT entry that pointed to it.
+func (f *FAT32Filesystem) followChainBackwards(endCluster, clusterCount uint32,
+	reversedFAT []uint32, chain *FATChain) error {
+	if f.FAT[endCluster] < clusterCount {
+		return fmt.Errorf("Internal error: not starting at end of chain")
+	}
+	chainEntries := uint64(1)
+	startCluster := endCluster
+	for reversedFAT[startCluster] < clusterCount {
+		startCluster = reversedFAT[startCluster]
+		chainEntries++
+	}
+	chain.Contiguous = true
+	chain.StartCluster = startCluster
+	chain.Size = chainEntries * SectorSize *
+		uint64(f.Header.BPB.SectorsPerCluster)
+	// Scan forward to see if the chain is contiguous (moving forward across
+	// adjacent clusters)
+	currentCluster := startCluster
+	for f.FAT[currentCluster] < clusterCount {
+		if f.FAT[currentCluster] != (currentCluster + 1) {
+			chain.Contiguous = false
+			break
+		}
+		currentCluster = f.FAT[currentCluster]
+	}
+	return nil
+}
+
+// Returns a list of chains in the filesystem; should correspond to a list of
+// possible files.
+func (f *FAT32Filesystem) GetAllChains() ([]FATChain, error) {
+	var e error
+	clusterCount := f.Header.BPB.LargeSectorCount /
+		uint32(f.Header.BPB.SectorsPerCluster)
+	// First, we'll calculate a "reversed" FAT that will let us follow chains
+	// backwards from their end.
+	reversedFAT := make([]uint32, len(f.FAT))
+	for i := range reversedFAT {
+		// This symbolic value will indicate that either we've reached the head
+		// of a chain or an unused block.
+		reversedFAT[i] = 0xffffffff
+	}
+	chainCount := 0
+	for i := uint32(2); i < clusterCount; i++ {
+		// Ignore the top 4 bits
+		v := f.FAT[i] & 0x0fffffff
+		// We don't need to record anything in the reversed FAT for end-of-
+		// chain or unused FAT entries.
+		if v >= clusterCount {
+			// Note that this isn't entirely correct; we could instead check
+			// for proper end-of-chain marks, but I want to potentially pick up
+			// partially corrupted chains.
+			chainCount++
+			// We don't store end-of-chain marks in the reversed map.
+			continue
+		}
+		if v == 0 {
+			// TODO: Double check that 0 is indeed always invalid.
+			continue
+		}
+		reversedFAT[v] = i
+	}
+	// Allocate the list of chains, and then reset chainCount to serve as an
+	// index into the list.
+	toReturn := make([]FATChain, chainCount)
+	chainCount = 0
+	for i := uint32(2); i < clusterCount; i++ {
+		v := f.FAT[i] & 0x0fffffff
+		if v < clusterCount {
+			// This is either a 0 or part of the middle of a chain.
+			continue
+		}
+		e = f.followChainBackwards(i, clusterCount, reversedFAT,
+			&(toReturn[chainCount]))
+		if e != nil {
+			return nil, fmt.Errorf("Failed following chain back: %w", e)
+		}
+		chainCount++
+	}
+	return toReturn, nil
+}
+
+// Returns a list of cluster numbers that match the given regular expression.
+func (f *FAT32Filesystem) FindRegexClusters(re string) ([]uint32, error) {
+	r, e := regexp.Compile(re)
+	if e != nil {
+		return nil, fmt.Errorf("Invalid regular expression: %w", e)
+	}
+	// TODO (next): Implement FindRegexClusters so I can look for the right
+	// things.
+	return nil, fmt.Errorf("Matching with %s not yet implemented!", r)
+}
+
+// Implements the io.Reader interface, used to obtain data contained within a
+// chain.
+type chainReader struct {
+	f              *FAT32Filesystem
+	readOffset     uint32
+	currentCluster uint32
+	size           uint32
+}
+
+// Returns an io.Reader that can be used to obtain the content of a chain.
+func (f *FAT32Filesystem) GetChainReader(c *FATChain) (io.Reader, error) {
+	return &chainReader{
+		f:              f,
+		readOffset:     0,
+		currentCluster: c.StartCluster,
+		size:           uint32(c.Size),
+	}, nil
+}
+
+// Returns the next single byte from the chain reader.
+func (f *chainReader) ReadByte() (byte, error) {
+	if f.readOffset >= f.size {
+		return 0, io.EOF
+	}
+	if (f.currentCluster < 2) || (f.currentCluster >= 0x0ffffff7) {
+		return 0, fmt.Errorf("Invalid cluster number: 0x%x", f.currentCluster)
+	}
+	// NOTE: This sector corresponds to the start of *cluster* number 2!
+	firstDataSector := uint32(f.f.Header.BPB.ReservedSectorCount) +
+		(uint32(f.f.Header.BPB.FATCount) * f.f.Header.EBR.SectorsPerFAT)
+	clusterSize := uint32(f.f.Header.BPB.SectorsPerCluster) * SectorSize
+	offsetInCluster := f.readOffset % clusterSize
+	overallOffset := (firstDataSector * SectorSize) +
+		((f.currentCluster - 2) * clusterSize) + offsetInCluster
+	dst := [1]byte{0}
+	_, e := f.f.Content.Seek(int64(overallOffset), io.SeekStart)
+	if e != nil {
+		return 0, fmt.Errorf("Failed seeking to offset %d: %w", overallOffset,
+			e)
+	}
+	_, e = f.f.Content.Read(dst[:])
+	if e != nil {
+		if e == io.EOF {
+			f.readOffset = f.size
+			return 0, e
+		}
+		return 0, fmt.Errorf("Error reading byte at offset %d: %w",
+			overallOffset, e)
+	}
+	f.readOffset++
+	// Advance to the next FAT entry if we read past the edge of a cluster and
+	// still have more data to go.
+	if (f.readOffset < f.size) && ((f.readOffset % clusterSize) == 0) {
+		f.currentCluster = f.f.FAT[f.currentCluster]
+	}
+	return dst[0], nil
+}
+
+func (f *chainReader) Read(dst []byte) (int, error) {
+	for i := 0; i < len(dst); i++ {
+		// TODO: This is *very* inefficient! Fix it to copy chunks rather than
+		// do a computation+seek+read per BYTE!
+		//  - If the chain is contiguous, just read it contiguously.
+		//  - If not, then read clusters in chunks.
+		tmp, e := f.ReadByte()
+		if e != nil {
+			return i, e
+		}
+		dst[i] = tmp
+	}
+	return len(dst), nil
+}
+
 // Loads our FAT32Filesystem struct, parsing header contents as necessary.
 // The content ReadSeeker must outlive the usage of the returned
 // FAT32Filesystem object.  For example, if it's backed by a file, the file
@@ -298,6 +510,10 @@ func NewFAT32Filesystem(content io.ReadSeeker) (*FAT32Filesystem, error) {
 	e = toReturn.parseFSInfo()
 	if e != nil {
 		return nil, fmt.Errorf("Error reading FSInfo block: %w", e)
+	}
+	e = toReturn.loadFAT()
+	if e != nil {
+		return nil, fmt.Errorf("Error loading FAT: %w", e)
 	}
 	return toReturn, nil
 }

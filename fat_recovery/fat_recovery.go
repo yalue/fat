@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/yalue/fat"
+	"io"
 	"os"
 )
 
@@ -49,6 +50,45 @@ func run() int {
 		return 1
 	}
 	fmt.Printf("Loaded FAT32 FS OK:\n%s\n", fatFS.FormatHumanReadable())
+	fmt.Printf("First FAT entries:\n")
+	for i := 0; i < 10; i++ {
+		fmt.Printf("  %d: 0x%08x\n", i, fatFS.FAT[i])
+	}
+	chains, e := fatFS.GetAllChains()
+	if e != nil {
+		fmt.Printf("Error getting chains: %s\n", e)
+		return 1
+	}
+	contiguousCount := 0
+	for i := range chains {
+		if chains[i].Contiguous {
+			contiguousCount++
+		}
+	}
+	fmt.Printf("Found %d chains in the FAT, %d were on contiguous clusters.\n",
+		len(chains), contiguousCount)
+
+	// FOR TESTING////////////////////////////////////////////////////////////////////////
+	tmpDest := "F:/temp_dump.bin"
+	fmt.Printf("Saving chain 100 to %s\n", tmpDest)
+	f, e := os.Create(tmpDest)
+	if e != nil {
+		fmt.Printf("Error opening %s: %s\n", tmpDest, e)
+		return 1
+	}
+	defer f.Close()
+	chainReader, e := fatFS.GetChainReader(&(chains[99]))
+	if e != nil {
+		fmt.Printf("Error getting chain reader: %s\n", e)
+		return 1
+	}
+	copied, e := io.Copy(f, chainReader)
+	if e != nil {
+		fmt.Printf("Error reading chain content: %s\n", e)
+		return 1
+	}
+	fmt.Printf("Copied %d bytes of data to %s\n", copied, tmpDest)
+	///////////////////////////////////////////////////////////////////// END TESTING ////
 	return 0
 }
 

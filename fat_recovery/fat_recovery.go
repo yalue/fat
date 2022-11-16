@@ -70,14 +70,14 @@ func run() int {
 
 	// FOR TESTING////////////////////////////////////////////////////////////////////////
 	tmpDest := "F:/temp_dump.bin"
-	fmt.Printf("Saving chain 100 to %s\n", tmpDest)
+	fmt.Printf("Saving chain 392 to %s\n", tmpDest)
 	f, e := os.Create(tmpDest)
 	if e != nil {
 		fmt.Printf("Error opening %s: %s\n", tmpDest, e)
 		return 1
 	}
 	defer f.Close()
-	chainReader, e := fatFS.GetChainReader(&(chains[99]))
+	chainReader, e := fatFS.GetChainReader(&(chains[392]))
 	if e != nil {
 		fmt.Printf("Error getting chain reader: %s\n", e)
 		return 1

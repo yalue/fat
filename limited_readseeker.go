@@ -13,7 +13,7 @@ import (
 // Wraps an underlying ReadSeeker, but limits reads to be within a single
 // region. WARNING: This will modify the offset of the underlying ReadSeeker
 // when used.
-type limitedReadSeeker struct {
+type LimitedReadSeeker struct {
 	wrapped    io.ReadSeeker
 	baseOffset int64
 	size       int64
@@ -21,9 +21,9 @@ type limitedReadSeeker struct {
 	currentOffset int64
 }
 
-// Used to optimize wrapping limitedReadSeeker instances: if it's detected,
+// Used to optimize wrapping LimitedReadSeeker instances: if it's detected,
 // just use the original wrapped object and adjust the offsets.
-func nestedReadSeekerOptimization(input *limitedReadSeeker, baseOffset,
+func nestedReadSeekerOptimization(input *LimitedReadSeeker, baseOffset,
 	limit int64) (io.ReadSeeker, error) {
 	if (baseOffset + limit) > input.size {
 		return nil, fmt.Errorf("Size of nested LimitedReadSeeker exceeds " +
@@ -37,7 +37,7 @@ func nestedReadSeekerOptimization(input *limitedReadSeeker, baseOffset,
 		return nil, fmt.Errorf("Failed seeking to base offset in underlying "+
 			"(wrapped) io.ReadSeeker: %w", e)
 	}
-	return &limitedReadSeeker{
+	return &LimitedReadSeeker{
 		wrapped:       input.wrapped,
 		baseOffset:    newBaseOffset,
 		size:          size,
@@ -53,7 +53,7 @@ func LimitReadSeeker(input io.ReadSeeker, baseOffset,
 	if limit <= baseOffset {
 		return nil, fmt.Errorf("The base offset must be below the limit")
 	}
-	tmp, isNested := input.(*limitedReadSeeker)
+	tmp, isNested := input.(*LimitedReadSeeker)
 	if isNested {
 		return nestedReadSeekerOptimization(tmp, baseOffset, limit)
 	}
@@ -62,7 +62,7 @@ func LimitReadSeeker(input io.ReadSeeker, baseOffset,
 		return nil, fmt.Errorf("Failed seeking to base offset in underlying "+
 			"io.ReadSeeker: %w", e)
 	}
-	return &limitedReadSeeker{
+	return &LimitedReadSeeker{
 		wrapped:       input,
 		currentOffset: 0,
 		baseOffset:    baseOffset,
@@ -70,13 +70,17 @@ func LimitReadSeeker(input io.ReadSeeker, baseOffset,
 	}, nil
 }
 
-func (s *limitedReadSeeker) Seek(offset int64, whence int) (int64, error) {
+func (s *LimitedReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	// We'll just set the internal currentOffset here. We actually do the Seek
+	// during the call to Read, in order to allow separate LimitedReadSeekers
+	// to work with the same underlying source without messing up each other's
+	// offsets (at least so long as calls to Read are not concurrent).
 	newOffset := s.currentOffset
 	switch whence {
 	case io.SeekStart:
 		newOffset = offset
 	case io.SeekCurrent:
-		newOffset -= offset
+		newOffset += offset
 	case io.SeekEnd:
 		newOffset = s.size + offset
 	}
@@ -85,11 +89,12 @@ func (s *limitedReadSeeker) Seek(offset int64, whence int) (int64, error) {
 		return s.size, io.EOF
 	}
 	s.currentOffset = newOffset
-	_, e := s.wrapped.Seek(s.baseOffset+newOffset, io.SeekStart)
-	return newOffset, e
+	return newOffset, nil
 }
 
-func (s *limitedReadSeeker) Read(dst []byte) (int, error) {
+// Note: this is *not* thread safe when using multiple wrapped ReadSeekers
+// with the same underlying source!
+func (s *LimitedReadSeeker) Read(dst []byte) (int, error) {
 	readSize := len(dst)
 	var resultErr error
 	readEndOffset := s.currentOffset + int64(readSize)
@@ -97,6 +102,10 @@ func (s *limitedReadSeeker) Read(dst []byte) (int, error) {
 		resultErr = io.EOF
 		bytesOver := readEndOffset - s.size
 		readSize = readSize - int(bytesOver)
+	}
+	_, e := s.wrapped.Seek(s.currentOffset+s.baseOffset, io.SeekStart)
+	if e != nil {
+		return 0, fmt.Errorf("Error seeking in underlying ReadSeeker: %w", e)
 	}
 	bytesRead, e := s.wrapped.Read(dst[0:readSize])
 	s.currentOffset += int64(bytesRead)

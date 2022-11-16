@@ -77,7 +77,7 @@ func run() int {
 		return 1
 	}
 	defer f.Close()
-	chainReader, e := fatFS.GetChainReader(&(chains[392]))
+	chainReader, e := fatFS.GetChainReader(&(chains[393]))
 	if e != nil {
 		fmt.Printf("Error getting chain reader: %s\n", e)
 		return 1

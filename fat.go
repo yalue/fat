@@ -462,6 +462,44 @@ func (f *FAT32Filesystem) GetChainReader(c *FATChain) (io.Reader, error) {
 	}, nil
 }
 
+func (f *chainReader) ReadByte() (byte, error) {
+	if f.readOffset >= f.size {
+		return 0, io.EOF
+	}
+	if (f.currentCluster < 2) || (f.currentCluster >= 0x0ffffff7) {
+		return 0, fmt.Errorf("Invalid cluster number: 0x%x", f.currentCluster)
+	}
+	// NOTE: This sector corresponds to the start of *cluster* number 2!
+	firstDataSector := uint32(f.f.Header.BPB.ReservedSectorCount) +
+		(uint32(f.f.Header.BPB.FATCount) * f.f.Header.EBR.SectorsPerFAT)
+	clusterSize := uint32(f.f.Header.BPB.SectorsPerCluster) * SectorSize
+	offsetInCluster := f.readOffset % clusterSize
+	overallOffset := (firstDataSector * SectorSize) +
+		((f.currentCluster - 2) * clusterSize) + offsetInCluster
+	dst := [1]byte{0}
+	_, e := f.f.Content.Seek(int64(overallOffset), io.SeekStart)
+	if e != nil {
+		return 0, fmt.Errorf("Failed seeking to offset %d: %w", overallOffset,
+			e)
+	}
+	_, e = f.f.Content.Read(dst[:])
+	if e != nil {
+		if e == io.EOF {
+			f.readOffset = f.size
+			return 0, e
+		}
+		return 0, fmt.Errorf("Error reading byte at offset %d: %w",
+			overallOffset, e)
+	}
+	f.readOffset++
+	// Advance to the next FAT entry if we read past the edge of a cluster and
+	// still have more data to go.
+	if (f.readOffset < f.size) && ((f.readOffset % clusterSize) == 0) {
+		f.currentCluster = f.f.FAT[f.currentCluster]
+	}
+	return dst[0], nil
+}
+
 func (f *chainReader) Read(dst []byte) (int, error) {
 	var e error
 	clusterSize := int(f.f.GetClusterSize())

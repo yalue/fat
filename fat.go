@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"regexp"
 )
 
 // The standard size of a drive sector, in bytes.

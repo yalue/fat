@@ -255,6 +255,9 @@ type FAT32Filesystem struct {
 	Header *FAT32Header
 	// The parsed FSInfo block
 	Info *FSInfo
+	// The cluster size, in bytes. Computing this is a common enough operation
+	// that we keep it around.
+	ClusterSize uint32
 	// We'll buffer the entire FAT in memory, unless it becomes a problem.
 	FAT []uint32
 }
@@ -340,8 +343,7 @@ func (f *FAT32Filesystem) followChainBackwards(endCluster, clusterCount uint32,
 	}
 	chain.Contiguous = true
 	chain.StartCluster = startCluster
-	chain.Size = chainEntries * SectorSize *
-		uint64(f.Header.BPB.SectorsPerCluster)
+	chain.Size = chainEntries * uint64(f.ClusterSize)
 	// Scan forward to see if the chain is contiguous (moving forward across
 	// adjacent clusters)
 	currentCluster := startCluster
@@ -409,40 +411,54 @@ func (f *FAT32Filesystem) GetAllChains() ([]FATChain, error) {
 	return toReturn, nil
 }
 
-// Returns a list of cluster numbers that match the given regular expression.
-func (f *FAT32Filesystem) FindRegexClusters(re string) ([]uint32, error) {
-	r, e := regexp.Compile(re)
-	if e != nil {
-		return nil, fmt.Errorf("Invalid regular expression: %w", e)
-	}
-	// TODO (next): Implement FindRegexClusters so I can look for the right
-	// things.
-	return nil, fmt.Errorf("Matching with %s not yet implemented!", r)
-}
-
 // Implements the io.Reader interface, used to obtain data contained within a
 // chain.
 type chainReader struct {
-	f              *FAT32Filesystem
-	readOffset     uint32
+	f *FAT32Filesystem
+	// The overall offset into the read
+	readOffset uint32
+	// The total size available (chain length * cluster size)
+	size uint32
+	// The current cluster number
 	currentCluster uint32
-	size           uint32
-}
-
-// Returns the size of a single cluster, in bytes.
-func (f *FAT32Filesystem) GetClusterSize() int64 {
-	return int64(f.Header.BPB.SectorsPerCluster) * SectorSize
+	// The offset into the current cluster (saves having to compute
+	// readOffset % clusterSize every time)
+	offsetInCluster uint32
+	// The cached copy of the last cluster read.
+	clusterContent []byte
 }
 
 // Returns the offset of the given offset (mod cluster size) into cluster c.
 func (f *FAT32Filesystem) GetDataOffset(c, offset uint32) int64 {
-	firstDataSector := int64(f.Header.BPB.ReservedSectorCount) +
-		(int64(uint32(f.Header.BPB.FATCount) * f.Header.EBR.SectorsPerFAT))
-	clusterSize := f.GetClusterSize()
-	offsetInCluster := int64(offset) % clusterSize
+	firstDataSector := uint32(f.Header.BPB.ReservedSectorCount) +
+		(uint32(f.Header.BPB.FATCount) * f.Header.EBR.SectorsPerFAT)
+	clusterSize := f.ClusterSize
+	offsetInCluster := offset % clusterSize
 	// Note that this is actually indexed by cluster # - 2.
-	return (firstDataSector * SectorSize) + ((int64(c) - 2) * clusterSize) +
-		offsetInCluster
+	return int64((firstDataSector * SectorSize) + ((c - 2) * clusterSize) +
+		offsetInCluster)
+}
+
+// Populates dst with the contents of the cluster at the given index. dst must
+// be at least large enough to hold the contents of an entire cluster.
+func (f *FAT32Filesystem) ReadCluster(c uint32, dst []byte) error {
+	clusterSize := int(f.ClusterSize)
+	if len(dst) < clusterSize {
+		return fmt.Errorf("Slice to small to hold a full cluster")
+	}
+	if (c < 2) || (c >= 0x0ffffff7) {
+		return fmt.Errorf("Invalid cluster number: 0x%x", c)
+	}
+	dataStart := f.GetDataOffset(c, 0)
+	_, e := f.Content.Seek(dataStart, io.SeekStart)
+	if e != nil {
+		return fmt.Errorf("Error seeking to cluster start: %w", e)
+	}
+	_, e = f.Content.Read(dst[0:clusterSize])
+	if e != nil {
+		return fmt.Errorf("Error reading cluster %d: %w", c, e)
+	}
+	return nil
 }
 
 // Returns an io.Reader that can be used to obtain the content of a chain.
@@ -454,27 +470,20 @@ func (f *FAT32Filesystem) GetChainReader(c *FATChain) (io.Reader, error) {
 		limit := dataStart + int64(c.Size)
 		return LimitReadSeeker(f.Content, dataStart, limit)
 	}
+	cachedCluster := make([]byte, f.ClusterSize)
+	e := f.ReadCluster(c.StartCluster, cachedCluster)
+	if e != nil {
+		return nil, fmt.Errorf("Error reading first cluster: %w", e)
+	}
 	return &chainReader{
-		f:              f,
-		readOffset:     0,
-		currentCluster: c.StartCluster,
-		size:           uint32(c.Size),
+		f:               f,
+		readOffset:      0,
+		size:            uint32(c.Size),
+		currentCluster:  c.StartCluster,
+		offsetInCluster: 0,
+		clusterContent:  cachedCluster,
 	}, nil
 }
-
-/*
-// Populates dst with the contents of the cluster at the given index. dst must
-// be at least large enough to hold the contents of an entire cluster.
-func (f *FAT32Filesystem) ReadCluster(c uint32, dst []byte) error {
-	clusterSize := int(f.GetClusterSize())
-	if len(dst) < clusterSize {
-		return fmt.Errorf("Slice to small to hold a full cluster")
-	}
-	firstDataSector
-	firstDataSector := uint32(f.f.Header.BPB.ReservedSectorCount) +
-		(uint32(f.f.Header.BPB.FATCount) * f.f.Header.EBR.SectorsPerFAT)
-
-}*/
 
 func (f *chainReader) ReadByte() (byte, error) {
 	if f.readOffset >= f.size {
@@ -483,32 +492,23 @@ func (f *chainReader) ReadByte() (byte, error) {
 	if (f.currentCluster < 2) || (f.currentCluster >= 0x0ffffff7) {
 		return 0, fmt.Errorf("Invalid cluster number: 0x%x", f.currentCluster)
 	}
-	clusterSize := uint32(f.f.GetClusterSize())
-	offsetInCluster := f.readOffset % clusterSize
-	overallOffset := f.f.GetDataOffset(f.currentCluster, offsetInCluster)
-	dst := [1]byte{0}
-	_, e := f.f.Content.Seek(int64(overallOffset), io.SeekStart)
-	if e != nil {
-		return 0, fmt.Errorf("Failed seeking to offset %d: %w", overallOffset,
-			e)
-	}
-	_, e = f.f.Content.Read(dst[:])
-	if e != nil {
-		if e == io.EOF {
-			f.readOffset = f.size
-			return 0, e
-		}
-		return 0, fmt.Errorf("Error reading byte at offset %d: %w",
-			overallOffset, e)
-	}
+	b := f.clusterContent[f.offsetInCluster]
+	f.offsetInCluster++
 	f.readOffset++
-	offsetInCluster++
-	// Advance to the next FAT entry if we read past the edge of a cluster and
-	// still have more data to go.
-	if (f.readOffset < f.size) && (offsetInCluster == clusterSize) {
-		f.currentCluster = f.f.FAT[f.currentCluster]
+	// Return now if we don't need to advance to the next cluster.
+	if (f.offsetInCluster < f.f.ClusterSize) || (f.readOffset >= f.size) {
+		return b, nil
 	}
-	return dst[0], nil
+	// We finished reading a cluster and still have more data to go; advance to
+	// the next cluster.
+	f.offsetInCluster = 0
+	f.currentCluster = f.f.FAT[f.currentCluster]
+	e := f.f.ReadCluster(f.currentCluster, f.clusterContent)
+	if e != nil {
+		return b, fmt.Errorf("Error reading next cluster in chain: %w", e)
+	}
+	// We already read the byte at the end of the previous cluster.
+	return b, nil
 }
 
 func (f *chainReader) Read(dst []byte) (int, error) {
@@ -535,9 +535,10 @@ func NewFAT32Filesystem(content io.ReadSeeker) (*FAT32Filesystem, error) {
 		return nil, fmt.Errorf("Error reading FAT32 header: %w", e)
 	}
 	toReturn := &FAT32Filesystem{
-		Content: content,
-		Header:  header,
-		Info:    nil,
+		Content:     content,
+		Header:      header,
+		ClusterSize: uint32(header.BPB.SectorsPerCluster) * SectorSize,
+		Info:        nil,
 	}
 	e = toReturn.parseFSInfo()
 	if e != nil {

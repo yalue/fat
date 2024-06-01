@@ -6,6 +6,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"image"
@@ -15,6 +17,11 @@ import (
 	"io"
 	"os"
 )
+
+// Used within the checkForAvi function; don't want to re-allocate them every
+// time.
+var aviHeader1 []byte = []byte("RIFF")
+var aviHeader2 []byte = []byte("AVI ")
 
 // Saves an image to the output directory if the given reader is at the start
 // of a recognized image file. Simply prints a message if outputDir is an empty
@@ -67,7 +74,43 @@ func checkForImage(src io.ReadSeeker, outputDir string, tag int) (bool, error) {
 
 // Checks for an avi-format file and saves it if found.
 func checkForAvi(src io.ReadSeeker, outputDir string, tag int) (bool, error) {
-	return false, fmt.Errorf("Not yet implemented")
+	startOffset, e := src.Seek(0, io.SeekCurrent)
+	if e != nil {
+		return false, fmt.Errorf("Error getting current offset: %s", e)
+	}
+	var buffer [12]byte
+	data := buffer[:]
+	_, e = src.Read(data)
+	if e != nil {
+		return false, fmt.Errorf("Error reading start of sector: %s", e)
+	}
+	if !bytes.Equal(data[0:4], aviHeader1) {
+		return false, nil
+	}
+	if !bytes.Equal(data[8:12], aviHeader2) {
+		return false, nil
+	}
+	contentSize := binary.LittleEndian.Uint32(data[4:8])
+	_, e = src.Seek(startOffset, io.SeekStart)
+	if e != nil {
+		return true, fmt.Errorf("Error seeking to start of avi file: %s", e)
+	}
+	if outputDir == "" {
+		fmt.Printf("Found .avi file %d, not saving.\n", tag)
+		return true, nil
+	}
+	outputPath := fmt.Sprintf("%s/video_%d.avi", outputDir, tag)
+	f, e := os.Create(outputPath)
+	if e != nil {
+		return true, fmt.Errorf("Error creating %s: %s", outputPath, e)
+	}
+	defer f.Close()
+	_, e = io.CopyN(f, src, int64(contentSize))
+	if e != nil {
+		return true, fmt.Errorf("Error writing %s: %s", outputPath, e)
+	}
+	fmt.Printf("Wrote file %s OK.\n", outputPath)
+	return true, nil
 }
 
 // The top level function that checks whether each sector begins a new file.
@@ -114,6 +157,20 @@ func scanForFiles(src io.ReadSeeker, sectorSize int, outputDir string) error {
 				offset, e)
 		}
 		if mp4Found {
+			currentTag++
+		}
+
+		// Next, check for .avi videos
+		_, e = src.Seek(offset, io.SeekStart)
+		if e != nil {
+			return fmt.Errorf("Error returning to offset %d: %s", offset, e)
+		}
+		aviFound, e := checkForAvi(src, outputDir, currentTag)
+		if e != nil {
+			return fmt.Errorf("Error checking for avi at offset %d: %s",
+				offset, e)
+		}
+		if aviFound {
 			currentTag++
 		}
 
